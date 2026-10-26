@@ -41,7 +41,11 @@ final class DSV4Kernels {
     private let compressEmitPSO: MTLComputePipelineState
     private let indexerScorePSO: MTLComputePipelineState
     private let indexerSelectPSO: MTLComputePipelineState
-    private let hcWeightsPSO: MTLComputePipelineState
+    private let hcMixPSO: MTLComputePipelineState
+    private let hcFinishPSO: MTLComputePipelineState
+    /// Row dots between `dsv4_hc_mix` and `dsv4_hc_finish`. One buffer serves
+    /// every site: Metal's hazard tracking orders the sites that share it.
+    private let hcMix: MTLBuffer
     private let hcCollapsePSO: MTLComputePipelineState
     private let hcPlaceMixPSO: MTLComputePipelineState
     private let hyperHeadPSO: MTLComputePipelineState
@@ -108,9 +112,16 @@ final class DSV4Kernels {
         self.compressEmitPSO = try context.pipeline("dsv4_compress_emit")
         self.indexerScorePSO = try context.pipeline("dsv4_indexer_score")
         self.indexerSelectPSO = try context.pipeline("dsv4_indexer_select")
-        self.hcWeightsPSO = try context.pipeline(
-            "dsv4_hc_weights", constants: [],
+        self.hcMixPSO = try context.pipeline(
+            "dsv4_hc_mix", constants: [],
             maxTotalThreadsPerThreadgroup: 256)
+        self.hcFinishPSO = try context.pipeline("dsv4_hc_finish")
+        guard let mixBuf = context.device.makeBuffer(
+            length: 24 * MemoryLayout<Float>.stride,
+            options: .storageModeShared) else {
+            throw MetalError.noDevice
+        }
+        self.hcMix = mixBuf
         self.hcCollapsePSO = try context.pipeline("dsv4_hc_collapse")
         self.hcPlaceMixPSO = try context.pipeline("dsv4_hc_place_mix")
         self.hyperHeadPSO = try context.pipeline(
@@ -345,29 +356,37 @@ final class DSV4Kernels {
                          outComb: MTLBuffer, outCombOffset: Int = 0,
                          hcMult: Int, hidden: Int, sinkhornIters: Int,
                          hcEps: Float, rmsEps: Float) {
-        precondition(hcMult <= 4, "dsv4_hc_weights sizes its mix scratch for hc_mult <= 4")
+        precondition(hcMult <= 4, "dsv4_hc_finish sizes its comb scratch for hc_mult <= 4")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(hcWeightsPSO)
-        enc.setBuffer(streams, offset: streamsOffset, index: 0)
-        enc.setBuffer(fn, offset: fnOffset, index: 1)
-        enc.setBuffer(base, offset: baseOffset, index: 2)
-        enc.setBuffer(scale, offset: scaleOffset, index: 3)
-        enc.setBuffer(outPre, offset: outPreOffset, index: 4)
-        enc.setBuffer(outPost, offset: outPostOffset, index: 5)
-        enc.setBuffer(outComb, offset: outCombOffset, index: 6)
         var mult = UInt32(hcMult)
         var hid = UInt32(hidden)
         var iters = UInt32(sinkhornIters)
         var he = hcEps
         var re = rmsEps
-        enc.setBytes(&mult, length: MemoryLayout<UInt32>.size, index: 7)
-        enc.setBytes(&hid, length: MemoryLayout<UInt32>.size, index: 8)
-        enc.setBytes(&iters, length: MemoryLayout<UInt32>.size, index: 9)
-        enc.setBytes(&he, length: MemoryLayout<Float>.size, index: 10)
-        enc.setBytes(&re, length: MemoryLayout<Float>.size, index: 11)
+        // A serial encoder runs the two dispatches in order, so the finisher
+        // sees every row's dot.
+        enc.setComputePipelineState(hcMixPSO)
+        enc.setBuffer(streams, offset: streamsOffset, index: 0)
+        enc.setBuffer(fn, offset: fnOffset, index: 1)
+        enc.setBuffer(hcMix, offset: 0, index: 2)
+        enc.setBytes(&mult, length: MemoryLayout<UInt32>.size, index: 3)
+        enc.setBytes(&hid, length: MemoryLayout<UInt32>.size, index: 4)
+        enc.setBytes(&re, length: MemoryLayout<Float>.size, index: 5)
         enc.dispatchThreadgroups(
-            MTLSize(width: 1, height: 1, depth: 1),
+            MTLSize(width: (2 + hcMult) * hcMult, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(hcFinishPSO)
+        enc.setBuffer(hcMix, offset: 0, index: 0)
+        enc.setBuffer(base, offset: baseOffset, index: 1)
+        enc.setBuffer(scale, offset: scaleOffset, index: 2)
+        enc.setBuffer(outPre, offset: outPreOffset, index: 3)
+        enc.setBuffer(outPost, offset: outPostOffset, index: 4)
+        enc.setBuffer(outComb, offset: outCombOffset, index: 5)
+        enc.setBytes(&mult, length: MemoryLayout<UInt32>.size, index: 6)
+        enc.setBytes(&iters, length: MemoryLayout<UInt32>.size, index: 7)
+        enc.setBytes(&he, length: MemoryLayout<Float>.size, index: 8)
+        enc.dispatchThreads(MTLSize(width: hcMult, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: hcMult, height: 1, depth: 1))
         enc.endEncoding()
     }
 
