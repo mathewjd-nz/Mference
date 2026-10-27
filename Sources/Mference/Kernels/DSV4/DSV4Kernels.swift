@@ -46,6 +46,8 @@ final class DSV4Kernels {
     /// Row dots between `dsv4_hc_mix` and `dsv4_hc_finish`. One buffer serves
     /// every site: Metal's hazard tracking orders the sites that share it.
     private let hcMix: MTLBuffer
+    /// Tokens one `encodeHCWeights` call may cover (rows of the `hcMix` scratch).
+    static let hcMaxTokens = 8
     private let hcCollapsePSO: MTLComputePipelineState
     private let hcPlaceMixPSO: MTLComputePipelineState
     private let hyperHeadPSO: MTLComputePipelineState
@@ -117,7 +119,7 @@ final class DSV4Kernels {
             maxTotalThreadsPerThreadgroup: 256)
         self.hcFinishPSO = try context.pipeline("dsv4_hc_finish")
         guard let mixBuf = context.device.makeBuffer(
-            length: 24 * MemoryLayout<Float>.stride,
+            length: 24 * Self.hcMaxTokens * MemoryLayout<Float>.stride,
             options: .storageModeShared) else {
             throw MetalError.noDevice
         }
@@ -137,7 +139,7 @@ final class DSV4Kernels {
     func encodeRope(commandBuffer: MTLCommandBuffer,
                     x: MTLBuffer, xOffset: Int = 0,
                     numHeads: Int, headDim: Int, ropeDim: Int,
-                    position: Int, rope: RopeKind, direction: Float) {
+                    position: Int, rope: RopeKind, direction: Float, tokens: Int = 1) {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(
             headDim == specializedHeadDim ? ropePSO : ropeGenericPSO)
@@ -154,7 +156,7 @@ final class DSV4Kernels {
         enc.setBytes(&dir, length: MemoryLayout<Float>.size, index: 5)
         let threads = max(32, ropeDim / 2)
         enc.dispatchThreadgroups(
-            MTLSize(width: numHeads, height: 1, depth: 1),
+            MTLSize(width: numHeads, height: tokens, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
         enc.endEncoding()
     }
@@ -355,8 +357,9 @@ final class DSV4Kernels {
                          outPost: MTLBuffer, outPostOffset: Int = 0,
                          outComb: MTLBuffer, outCombOffset: Int = 0,
                          hcMult: Int, hidden: Int, sinkhornIters: Int,
-                         hcEps: Float, rmsEps: Float) {
+                         hcEps: Float, rmsEps: Float, tokens: Int = 1) {
         precondition(hcMult <= 4, "dsv4_hc_finish sizes its comb scratch for hc_mult <= 4")
+        precondition(tokens >= 1 && tokens <= Self.hcMaxTokens)
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         var mult = UInt32(hcMult)
         var hid = UInt32(hidden)
@@ -373,7 +376,7 @@ final class DSV4Kernels {
         enc.setBytes(&hid, length: MemoryLayout<UInt32>.size, index: 4)
         enc.setBytes(&re, length: MemoryLayout<Float>.size, index: 5)
         enc.dispatchThreadgroups(
-            MTLSize(width: (2 + hcMult) * hcMult, height: 1, depth: 1),
+            MTLSize(width: (2 + hcMult) * hcMult, height: tokens, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.setComputePipelineState(hcFinishPSO)
         enc.setBuffer(hcMix, offset: 0, index: 0)
@@ -385,8 +388,8 @@ final class DSV4Kernels {
         enc.setBytes(&mult, length: MemoryLayout<UInt32>.size, index: 6)
         enc.setBytes(&iters, length: MemoryLayout<UInt32>.size, index: 7)
         enc.setBytes(&he, length: MemoryLayout<Float>.size, index: 8)
-        enc.dispatchThreads(MTLSize(width: hcMult, height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: hcMult, height: 1, depth: 1))
+        enc.dispatchThreadgroups(MTLSize(width: tokens, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: hcMult, height: 1, depth: 1))
         enc.endEncoding()
     }
 
@@ -394,7 +397,7 @@ final class DSV4Kernels {
                           streams: MTLBuffer, streamsOffset: Int = 0,
                           pre: MTLBuffer, preOffset: Int = 0,
                           x: MTLBuffer, xOffset: Int = 0,
-                          hcMult: Int, hidden: Int) {
+                          hcMult: Int, hidden: Int, tokens: Int = 1) {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(hcCollapsePSO)
         enc.setBuffer(streams, offset: streamsOffset, index: 0)
@@ -404,7 +407,7 @@ final class DSV4Kernels {
         var hid = UInt32(hidden)
         enc.setBytes(&mult, length: MemoryLayout<UInt32>.size, index: 3)
         enc.setBytes(&hid, length: MemoryLayout<UInt32>.size, index: 4)
-        enc.dispatchThreads(MTLSize(width: hidden, height: 1, depth: 1),
+        enc.dispatchThreads(MTLSize(width: hidden, height: tokens, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding()
     }
@@ -417,7 +420,7 @@ final class DSV4Kernels {
                           post: MTLBuffer, postOffset: Int = 0,
                           comb: MTLBuffer, combOffset: Int = 0,
                           outStreams: MTLBuffer, outStreamsOffset: Int = 0,
-                          hcMult: Int, hidden: Int) {
+                          hcMult: Int, hidden: Int, tokens: Int = 1) {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(hcPlaceMixPSO)
         enc.setBuffer(streams, offset: streamsOffset, index: 0)
@@ -429,7 +432,7 @@ final class DSV4Kernels {
         var hid = UInt32(hidden)
         enc.setBytes(&mult, length: MemoryLayout<UInt32>.size, index: 5)
         enc.setBytes(&hid, length: MemoryLayout<UInt32>.size, index: 6)
-        enc.dispatchThreads(MTLSize(width: hidden, height: hcMult, depth: 1),
+        enc.dispatchThreads(MTLSize(width: hidden, height: hcMult, depth: tokens),
                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.endEncoding()
     }

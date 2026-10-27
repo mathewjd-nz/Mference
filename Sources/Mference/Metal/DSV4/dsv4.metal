@@ -50,15 +50,19 @@ kernel void dsv4_rope_interleaved_trailing(
     constant uint& position [[buffer(3)]],
     device const float* inv_freq [[buffer(4)]],   // [rope_dim / 2]
     constant float& direction [[buffer(5)]],
-    uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint2 tgs [[threadgroups_per_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]]
 ) {
     const uint head_dim = dsv4_head_dim(head_dim_in);
     const uint rope_dim = dsv4_rope_dim(rope_dim_in);
     const uint half_dim = rope_dim / 2u;
+    const uint tid = tid2.x;
     if (tid >= half_dim) return;
+    // Grid y is the token of a batch at consecutive positions (decode: one).
+    const uint head = tgp.y * tgs.x + tgp.x;
     const uint base = head * head_dim + (head_dim - rope_dim);
-    const float freq = float(position) * inv_freq[tid];
+    const float freq = float(position + tgp.y) * inv_freq[tid];
     const float c = cos(freq);
     const float s = sin(freq) * direction;
     const float x0 = float(x[base + 2u * tid]);
@@ -608,14 +612,19 @@ kernel void dsv4_hc_mix(
     constant uint& hc_mult [[buffer(3)]],
     constant uint& hidden [[buffer(4)]],
     constant float& rms_eps [[buffer(5)]],
-    uint r [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]
 ) {
     threadgroup float red[8];
     threadgroup float inv_norm_tg;
     const uint flat = hc_mult * hidden;
+    // Grid y is the token of a batch (decode: one token).
+    const uint r = tgp.x;
+    const uint tid = tid2.x;
+    streams += tgp.y * flat;
+    mix += tgp.y * (2u + hc_mult) * hc_mult;
 
     // Both loops issue a batch of loads before the batch's fmas: the fmas
     // still run one after another in the original order, but the loads no
@@ -682,10 +691,16 @@ kernel void dsv4_hc_finish(
     constant uint& hc_mult [[buffer(6)]],
     constant uint& sinkhorn_iters [[buffer(7)]],
     constant float& hc_eps [[buffer(8)]],
-    uint t [[thread_position_in_threadgroup]]
+    uint t [[thread_position_in_threadgroup]],
+    uint tok [[threadgroup_position_in_grid]]
 ) {
     threadgroup float comb[16];
     const uint H = hc_mult;
+    // One threadgroup per token of a batch (decode: one token).
+    mix += tok * (2u + H) * H;
+    out_pre += tok * H;
+    out_post += tok * H;
+    out_comb += tok * H * H;
     const bool lead = t < H;   // thread t owns pre/post[t], row t, column t
     if (lead) {
         out_pre[t] = 1.0f / (1.0f + fast::exp(-(mix[t] * scale3[0] + base_b[t])))
@@ -748,9 +763,14 @@ kernel void dsv4_hc_collapse(
     device half* x [[buffer(2)]],
     constant uint& hc_mult [[buffer(3)]],
     constant uint& hidden [[buffer(4)]],
-    uint d [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
+    const uint d = gid.x;
     if (d >= hidden) return;
+    // Grid y is the token of a batch (decode: one token).
+    streams += gid.y * hc_mult * hidden;
+    pre += gid.y * hc_mult;
+    x += gid.y * hidden;
     float acc = 0.0f;
     for (uint j = 0; j < hc_mult; ++j) {
         acc = fma(pre[j], float(streams[j * hidden + d]), acc);
@@ -771,11 +791,17 @@ kernel void dsv4_hc_place_mix(
     device half* out_streams [[buffer(4)]],
     constant uint& hc_mult [[buffer(5)]],
     constant uint& hidden [[buffer(6)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint3 gid [[thread_position_in_grid]]
 ) {
     const uint k = gid.y;
     const uint d = gid.x;
     if (k >= hc_mult || d >= hidden) return;
+    // Grid z is the token of a batch (decode: one token).
+    streams += gid.z * hc_mult * hidden;
+    sub += gid.z * hidden;
+    post += gid.z * hc_mult;
+    comb += gid.z * hc_mult * hc_mult;
+    out_streams += gid.z * hc_mult * hidden;
     float acc = post[k] * float(sub[d]);
     for (uint j = 0; j < hc_mult; ++j) {
         acc = fma(comb[j * hc_mult + k], float(streams[j * hidden + d]), acc);

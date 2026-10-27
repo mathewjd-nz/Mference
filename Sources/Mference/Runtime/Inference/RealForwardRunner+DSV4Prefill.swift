@@ -95,6 +95,11 @@ final class DSV4ChunkedPrefill {
     /// Tokens whose state-free projections share one weight read.
     static let projectionBatch = DequantInt4GEMVMultiX.maxTokens
 
+    /// Routes per simdgroup in the routed pair kernels
+    /// (`kDSV4PrefillGroupRoutes` in `moe.metal`): each expert's route list is
+    /// padded to a multiple of this with invalid entries.
+    static let groupRoutes = 4
+
     private let b: DSV4PrefillBindings
     private let chunkTokens: Int
 
@@ -127,7 +132,7 @@ final class DSV4ChunkedPrefill {
     private let acts: MTLBuffer             // [T * topK, FmoE] FP16
     private let partials: MTLBuffer         // [T * topK, D] FP32
     private let routesBuffer: MTLBuffer     // [T * topK] DSV4PrefillRoute
-    private let routerLogits: MTLBuffer     // [numExperts] FP32
+    private let routerLogits: MTLBuffer     // [B, numExperts] FP32
     private let hcPostF: MTLBuffer          // [T, mult] FP32
     private let hcCombF: MTLBuffer          // [T, mult * mult] FP32
 
@@ -136,8 +141,6 @@ final class DSV4ChunkedPrefill {
     private let hidden: MTLBuffer
     private let normed: MTLBuffer
     private let attnOut: MTLBuffer
-    private let hcPreA: MTLBuffer
-    private let hcPreF: MTLBuffer
 
     // Projection-batch scratch, one row per token of a batch of up to
     // `projectionBatch` tokens: the projections that need no other token's
@@ -147,6 +150,9 @@ final class DSV4ChunkedPrefill {
     private let normedB: MTLBuffer          // [B, D]
     private let qaB: MTLBuffer              // [B, qLoraRank]
     private let qB: MTLBuffer               // [B, numHeads * headDim]
+    private let kvB: MTLBuffer              // [B, headDim]
+    private let hiddenB: MTLBuffer          // [B, D] collapsed streams
+    private let hcPreAB: MTLBuffer          // [B, mult] FP32
     private let oGroupedB: MTLBuffer        // [B, oGroups * oLoraRank]
     private let oOutB: MTLBuffer            // [B, D]
     private let hcPostAB: MTLBuffer         // [B, mult] FP32
@@ -197,9 +203,9 @@ final class DSV4ChunkedPrefill {
             MetalFunctionConstant(index: 42, value: .uint32(UInt32(MoEDeepseekV4.topK))),
             MetalFunctionConstant(index: 43, value: .bool(true)),
         ]
-        self.phase1PSO = try ctx.pipeline("dsv4_prefill_moe_phase1_pairs_int2",
+        self.phase1PSO = try ctx.pipeline("dsv4_prefill_moe_phase1_groups_int2",
                                           constants: moeConstants)
-        self.downPSO = try ctx.pipeline("dsv4_prefill_moe_down_pairs_int2",
+        self.downPSO = try ctx.pipeline("dsv4_prefill_moe_down_groups_int2",
                                         constants: moeConstants)
         self.reducePSO = try ctx.pipeline("dsv4_prefill_moe_reduce_pairs_k6",
                                           constants: moeConstants)
@@ -213,7 +219,7 @@ final class DSV4ChunkedPrefill {
         self.routerHashPSO = try ctx.pipeline("router_hash_weights_k6_par")
 
         guard let phase1Fn = ctx.library.makeFunction(
-                name: "dsv4_prefill_moe_phase1_pairs_int2") else {
+                name: "dsv4_prefill_moe_phase1_groups_int2") else {
             throw MetalError.noDevice
         }
         self.argEncoder = phase1Fn.makeArgumentEncoder(bufferIndex: 0)
@@ -264,9 +270,10 @@ final class DSV4ChunkedPrefill {
         self.acts = try buf(chunkTokens * topK * actStride, "dsv4.prefill.acts")
         self.partials = try buf(chunkTokens * topK * partialStride,
                                 "dsv4.prefill.partials")
-        self.routesBuffer = try buf(chunkTokens * topK * MemoryLayout<DSV4PrefillRoute>.stride,
+        let paddedRoutes = chunkTokens * topK + cfg.numExperts * (Self.groupRoutes - 1)
+        self.routesBuffer = try buf(paddedRoutes * MemoryLayout<DSV4PrefillRoute>.stride,
                                     "dsv4.prefill.routes")
-        self.routerLogits = try buf(cfg.numExperts * MemoryLayout<Float>.stride,
+        self.routerLogits = try buf(Self.projectionBatch * cfg.numExperts * MemoryLayout<Float>.stride,
                                     "dsv4.prefill.routerLogits")
         self.hcPostF = try buf(chunkTokens * hcPostStride, "dsv4.prefill.hcPostF")
         self.hcCombF = try buf(chunkTokens * hcCombStride, "dsv4.prefill.hcCombF")
@@ -274,15 +281,17 @@ final class DSV4ChunkedPrefill {
         let ca = cfg.compressedAttention
         self.hidden = try buf(hiddenStride, "dsv4.prefill.hidden")
         self.normed = try buf(hiddenStride, "dsv4.prefill.normed")
-        self.attnOut = try buf(cfg.numHeads * cfg.fullHeadDim * fp16, "dsv4.prefill.attnOut")
-        self.hcPreA = try buf(hcPostStride, "dsv4.prefill.hcPreA")
-        self.hcPreF = try buf(hcPostStride, "dsv4.prefill.hcPreF")
+        self.attnOut = try buf(Self.projectionBatch * cfg.numHeads * cfg.fullHeadDim * fp16,
+                               "dsv4.prefill.attnOut")
 
         let batch = Self.projectionBatch
         self.multiX = try DequantInt4GEMVMultiX(context: ctx)
         self.normedB = try buf(batch * hiddenStride, "dsv4.prefill.normedB")
         self.qaB = try buf(batch * ca.qLoraRank * fp16, "dsv4.prefill.qaB")
         self.qB = try buf(batch * cfg.numHeads * cfg.fullHeadDim * fp16, "dsv4.prefill.qB")
+        self.kvB = try buf(batch * cfg.fullHeadDim * fp16, "dsv4.prefill.kvB")
+        self.hiddenB = try buf(batch * hiddenStride, "dsv4.prefill.hiddenB")
+        self.hcPreAB = try buf(batch * hcPostStride, "dsv4.prefill.hcPreAB")
         self.oGroupedB = try buf(batch * max(ca.oGroups, 1) * ca.oLoraRank * fp16,
                                  "dsv4.prefill.oGroupedB")
         self.oOutB = try buf(batch * hiddenStride, "dsv4.prefill.oOutB")
@@ -374,11 +383,36 @@ final class DSV4ChunkedPrefill {
 
         try Task.checkCancellation()
         try encodeEmbedding(tokens: tokenList)
+        // A chunk this long routes to nearly every expert of every layer, so
+        // each layer's sweep reads its whole expert file. Read the next
+        // layer's file into the page cache while this layer's tail and the
+        // next attention site run, when the SSD would otherwise sit idle.
+        let warmAhead = T * b.cfg.topKExperts >= 4 * b.cfg.numExperts
+        var warming: (stop: StopFlag, done: DispatchGroup)?
+        func stopWarming() {
+            warming?.stop.set()
+            warming?.done.wait()
+            warming = nil
+        }
+        func startWarming(layer: Int) {
+            guard warmAhead, layer < b.cfg.numLayers,
+                  let streamer = try? b.model.routedExpertStreamer(layer: layer) else { return }
+            let stop = StopFlag()
+            let done = DispatchGroup()
+            DispatchQueue.global(qos: .userInitiated).async(group: done) {
+                streamer.warmPageCache { stop.isSet }
+            }
+            warming = (stop, done)
+        }
+        defer { stopWarming() }
+        startWarming(layer: 0)
         for layer in 0..<b.cfg.numLayers {
             try Task.checkCancellation()
             try encodeAttentionSite(layer: layer, tokens: tokenList,
                                     startPosition: startPosition, count: T)
             try await runRoutedMoE(layer: layer, count: T)
+            stopWarming()
+            startWarming(layer: layer + 1)
             try encodeLayerTail(layer: layer, count: T)
             try didCompleteLayer?(layer)
         }
@@ -454,10 +488,9 @@ final class DSV4ChunkedPrefill {
         let hashTable = isHash ? try b.model.dsv4HashTable(layer: L) : nil
 
         var counters = b.state.counters[L]
-        let cb = try makeCommandBuffer()
+        var cb = try makeCommandBuffer()
         let qaStride = ca.qLoraRank * fp16
         let qStride = numHeads * headDim * fp16
-        let oGroupedStride = ca.oGroups * ca.oLoraRank * fp16
 
         // Tokens run in batches. Within a batch, every step that reads only the
         // token's own residual streams (mHC, norms, q projections) runs for the
@@ -468,52 +501,45 @@ final class DSV4ChunkedPrefill {
         for t0 in stride(from: 0, to: T, by: Self.projectionBatch) {
             let n = min(Self.projectionBatch, T - t0)
 
-            for j in 0..<n {
-                let streamOff = (t0 + j) * streamStride
-                b.dsv4.encodeHCWeights(commandBuffer: cb,
-                                       streams: streams, streamsOffset: streamOff,
-                                       fn: attnFn.buffer, fnOffset: Int(attnFn.offset),
-                                       base: attnBase.buffer, baseOffset: Int(attnBase.offset),
-                                       scale: attnScale3.buffer, scaleOffset: Int(attnScale3.offset),
-                                       outPre: hcPreA,
-                                       outPost: hcPostAB, outPostOffset: j * hcPostStride,
-                                       outComb: hcCombAB, outCombOffset: j * hcCombStride,
-                                       hcMult: hc.mult, hidden: cfg.hiddenSize,
-                                       sinkhornIters: hc.sinkhornIters,
-                                       hcEps: Float(hc.eps), rmsEps: eps)
-                b.dsv4.encodeHCCollapse(commandBuffer: cb,
-                                        streams: streams, streamsOffset: streamOff,
-                                        pre: hcPreA, x: hidden,
-                                        hcMult: hc.mult, hidden: cfg.hiddenSize)
-                b.rms.encodeBF16W(commandBuffer: cb, x: hidden,
-                                  weight: inNorm.buffer, weightOffset: Int(inNorm.offset),
-                                  out: normedB, outOffset: j * hiddenStride, d: D, eps: eps)
-            }
+            let batchStreamOff = t0 * streamStride
+            b.dsv4.encodeHCWeights(commandBuffer: cb,
+                                   streams: streams, streamsOffset: batchStreamOff,
+                                   fn: attnFn.buffer, fnOffset: Int(attnFn.offset),
+                                   base: attnBase.buffer, baseOffset: Int(attnBase.offset),
+                                   scale: attnScale3.buffer, scaleOffset: Int(attnScale3.offset),
+                                   outPre: hcPreAB, outPost: hcPostAB, outComb: hcCombAB,
+                                   hcMult: hc.mult, hidden: cfg.hiddenSize,
+                                   sinkhornIters: hc.sinkhornIters,
+                                   hcEps: Float(hc.eps), rmsEps: eps, tokens: n)
+            b.dsv4.encodeHCCollapse(commandBuffer: cb,
+                                    streams: streams, streamsOffset: batchStreamOff,
+                                    pre: hcPreAB, x: hiddenB,
+                                    hcMult: hc.mult, hidden: cfg.hiddenSize, tokens: n)
+            // One row per token: the per-head kernel is the row kernel at an offset.
+            b.rms.encodeBF16WPerHead(commandBuffer: cb, x: hiddenB,
+                                     weight: inNorm.buffer, weightOffset: Int(inNorm.offset),
+                                     out: normedB, headDim: D, numHeads: n, eps: eps)
 
             multiGemv(cb, qaView, x: normedB, y: qaB,
                       m: ca.qLoraRank, n: cfg.hiddenSize, tokens: n)
-            for j in 0..<n {
-                b.rms.encodeBF16W(commandBuffer: cb, x: qaB, xOffset: j * qaStride,
-                                  weight: qaNormView.buffer,
-                                  weightOffset: Int(qaNormView.offset),
-                                  out: qaB, outOffset: j * qaStride,
-                                  d: UInt32(ca.qLoraRank), eps: eps)
-            }
+            b.rms.encodeBF16WPerHead(commandBuffer: cb, x: qaB,
+                                     weight: qaNormView.buffer,
+                                     weightOffset: Int(qaNormView.offset),
+                                     out: qaB, headDim: UInt32(ca.qLoraRank),
+                                     numHeads: n, eps: eps)
             multiGemv(cb, qbView, x: qaB, y: qB,
                       m: numHeads * headDim, n: ca.qLoraRank, tokens: n)
-            for j in 0..<n {
-                b.rms.encodeNoScalePerHead(commandBuffer: cb,
-                                           x: qB, xOffset: j * qStride,
-                                           out: qB, outOffset: j * qStride,
-                                           headDim: UInt32(headDim),
-                                           numHeads: numHeads, eps: eps)
-                b.dsv4.encodeRope(commandBuffer: cb, x: qB, xOffset: j * qStride,
-                                  numHeads: numHeads, headDim: headDim,
-                                  ropeDim: ca.ropeHeadDim,
-                                  position: startPosition + t0 + j,
-                                  rope: ropeKind, direction: 1)
-            }
+            b.rms.encodeNoScalePerHead(commandBuffer: cb, x: qB, out: qB,
+                                       headDim: UInt32(headDim),
+                                       numHeads: numHeads * n, eps: eps)
+            b.dsv4.encodeRope(commandBuffer: cb, x: qB,
+                              numHeads: numHeads, headDim: headDim,
+                              ropeDim: ca.ropeHeadDim,
+                              position: startPosition + t0,
+                              rope: ropeKind, direction: 1, tokens: n)
 
+            multiGemv(cb, kvView, x: normedB, y: kvB,
+                      m: headDim, n: cfg.hiddenSize, tokens: n)
             for j in 0..<n {
                 let t = t0 + j
                 let position = startPosition + t
@@ -522,9 +548,7 @@ final class DSV4ChunkedPrefill {
                 let slot = b.state.windowSlot(position: position)
                 let ring = b.state.windowKV[L]
                 let slotOffset = slot * headDim * fp16
-                gemv(cb, kvView, x: normedB, xOffset: normedOff, y: ring, yOffset: slotOffset,
-                     m: headDim, n: cfg.hiddenSize)
-                b.rms.encodeBF16W(commandBuffer: cb, x: ring, xOffset: slotOffset,
+                b.rms.encodeBF16W(commandBuffer: cb, x: kvB, xOffset: j * headDim * fp16,
                                   weight: kvNormView.buffer,
                                   weightOffset: Int(kvNormView.offset),
                                   out: ring, outOffset: slotOffset,
@@ -543,13 +567,18 @@ final class DSV4ChunkedPrefill {
                     let compGate = try b.model.dsv4CompressorGateProj(layer: L)
                     let compNorm = try b.model.dsv4CompressorKVNorm(layer: L)
                     let compBias = try b.model.dsv4CompressorPositionBias(layer: L)
-                    let rowOffset = counters.pendingRows * rowWidth * fp16
-                    gemv(cb, compKV, x: normedB, xOffset: normedOff,
-                         y: b.state.pendingKV[L]!, yOffset: rowOffset,
-                         m: rowWidth, n: cfg.hiddenSize)
-                    gemv(cb, compGate, x: normedB, xOffset: normedOff,
-                         y: b.state.pendingGate[L]!, yOffset: rowOffset,
-                         m: rowWidth, n: cfg.hiddenSize)
+                    // Pending rows for the run of tokens up to the next emit
+                    // (or the batch end), encoded after the previous emit.
+                    if j == 0 || counters.pendingRows == 0 {
+                        let run = min(rate - counters.pendingRows, n - j)
+                        let rowOffset = counters.pendingRows * rowWidth * fp16
+                        multiGemv(cb, compKV, x: normedB, xOffset: normedOff,
+                                  y: b.state.pendingKV[L]!, yOffset: rowOffset,
+                                  m: rowWidth, n: cfg.hiddenSize, tokens: run)
+                        multiGemv(cb, compGate, x: normedB, xOffset: normedOff,
+                                  y: b.state.pendingGate[L]!, yOffset: rowOffset,
+                                  m: rowWidth, n: cfg.hiddenSize, tokens: run)
+                    }
                     willEmit = counters.pendingRows + 1 == rate
                     if willEmit {
                         let entry = counters.compressedEntries
@@ -584,13 +613,16 @@ final class DSV4ChunkedPrefill {
                         let idxGate = try b.model.dsv4IndexerGateProj(layer: L)
                         let idxNorm = try b.model.dsv4IndexerKVNorm(layer: L)
                         let idxBias = try b.model.dsv4IndexerPositionBias(layer: L)
-                        let idxRowOffset = counters.indexerPendingRows * 2 * idxDim * fp16
-                        gemv(cb, idxKV, x: normedB, xOffset: normedOff,
-                             y: b.state.indexerPendingKV[L]!, yOffset: idxRowOffset,
-                             m: 2 * idxDim, n: cfg.hiddenSize)
-                        gemv(cb, idxGate, x: normedB, xOffset: normedOff,
-                             y: b.state.indexerPendingGate[L]!, yOffset: idxRowOffset,
-                             m: 2 * idxDim, n: cfg.hiddenSize)
+                        if j == 0 || counters.indexerPendingRows == 0 {
+                            let run = min(idxRate - counters.indexerPendingRows, n - j)
+                            let idxRowOffset = counters.indexerPendingRows * 2 * idxDim * fp16
+                            multiGemv(cb, idxKV, x: normedB, xOffset: normedOff,
+                                      y: b.state.indexerPendingKV[L]!, yOffset: idxRowOffset,
+                                      m: 2 * idxDim, n: cfg.hiddenSize, tokens: run)
+                            multiGemv(cb, idxGate, x: normedB, xOffset: normedOff,
+                                      y: b.state.indexerPendingGate[L]!, yOffset: idxRowOffset,
+                                      m: 2 * idxDim, n: cfg.hiddenSize, tokens: run)
+                        }
                         willEmitIndexer = counters.indexerPendingRows + 1 == idxRate
                         if willEmitIndexer {
                             let entry = counters.indexerEntries
@@ -652,7 +684,7 @@ final class DSV4ChunkedPrefill {
                     compressedKV: b.state.compressedKV[L] ?? ring,
                     selected: selected,
                     sinks: sinksView.buffer, sinksOffset: Int(sinksView.offset),
-                    out: attnOut,
+                    out: attnOut, outOffset: j * qStride,
                     headDim: headDim, numHeads: numHeads,
                     windowCount: b.state.windowCount(position: position),
                     windowStartPos: b.state.windowStartPosition(position: position),
@@ -660,20 +692,6 @@ final class DSV4ChunkedPrefill {
                     compressedCount: compressedCount,
                     selectedCount: selectedCount,
                     scale: Float(cfg.attentionScale))
-                b.dsv4.encodeRope(commandBuffer: cb, x: attnOut,
-                                  numHeads: numHeads, headDim: headDim,
-                                  ropeDim: ca.ropeHeadDim,
-                                  position: position, rope: ropeKind, direction: -1)
-
-                b.dsv4.encodeOGroupProjection(
-                    commandBuffer: cb,
-                    weights: oaView.buffer, weightsOffset: Int(oaView.offset),
-                    scales: oaView.buffer, scalesOffset: Int(oaView.scaleOffset),
-                    biases: oaView.buffer, biasesOffset: Int(oaView.biasOffset),
-                    x: attnOut, y: oGroupedB, yOffset: j * oGroupedStride,
-                    rank: ca.oLoraRank,
-                    groupIn: numHeads * headDim / ca.oGroups,
-                    groups: ca.oGroups)
 
                 counters.tokens += 1
                 if isCompressed {
@@ -696,56 +714,68 @@ final class DSV4ChunkedPrefill {
                 }
             }
 
+            b.dsv4.encodeRope(commandBuffer: cb, x: attnOut,
+                              numHeads: numHeads, headDim: headDim,
+                              ropeDim: ca.ropeHeadDim,
+                              position: startPosition + t0, rope: ropeKind,
+                              direction: -1, tokens: n)
+            // Grouped o_a for the whole batch: one weight read per batch
+            // instead of one per token.
+            multiX.encodeGrouped(commandBuffer: cb,
+                weights: oaView.buffer, weightsOffset: Int(oaView.offset),
+                scales: oaView.buffer, scalesOffset: Int(oaView.scaleOffset),
+                biases: oaView.buffer, biasesOffset: Int(oaView.biasOffset),
+                x: attnOut, y: oGroupedB,
+                m: ca.oGroups * ca.oLoraRank, n: numHeads * headDim / ca.oGroups, tokens: n,
+                rowsPerGroup: ca.oLoraRank, xStride: numHeads * headDim)
             multiGemv(cb, obView, x: oGroupedB, y: oOutB,
                       m: cfg.hiddenSize, n: ca.oGroups * ca.oLoraRank, tokens: n)
 
+            b.dsv4.encodeHCPlaceMix(commandBuffer: cb,
+                                    streams: streams, streamsOffset: batchStreamOff,
+                                    sub: oOutB, post: hcPostAB, comb: hcCombAB,
+                                    outStreams: streamsAlt, outStreamsOffset: batchStreamOff,
+                                    hcMult: hc.mult, hidden: cfg.hiddenSize, tokens: n)
+            b.dsv4.encodeHCWeights(commandBuffer: cb,
+                                   streams: streamsAlt, streamsOffset: batchStreamOff,
+                                   fn: ffnFn.buffer, fnOffset: Int(ffnFn.offset),
+                                   base: ffnBase.buffer, baseOffset: Int(ffnBase.offset),
+                                   scale: ffnScale3.buffer, scaleOffset: Int(ffnScale3.offset),
+                                   outPre: hcPreAB,
+                                   outPost: hcPostF, outPostOffset: t0 * hcPostStride,
+                                   outComb: hcCombF, outCombOffset: t0 * hcCombStride,
+                                   hcMult: hc.mult, hidden: cfg.hiddenSize,
+                                   sinkhornIters: hc.sinkhornIters,
+                                   hcEps: Float(hc.eps), rmsEps: eps, tokens: n)
+            b.dsv4.encodeHCCollapse(commandBuffer: cb,
+                                    streams: streamsAlt, streamsOffset: batchStreamOff,
+                                    pre: hcPreAB, x: hiddenB,
+                                    hcMult: hc.mult, hidden: cfg.hiddenSize, tokens: n)
+            b.rms.encodeBF16WPerHead(commandBuffer: cb, x: hiddenB,
+                                     weight: postAttn.buffer,
+                                     weightOffset: Int(postAttn.offset),
+                                     out: routedX, outOffset: t0 * hiddenStride,
+                                     headDim: D, numHeads: n, eps: eps)
+            encodeRouterGemv(cb, weights: routerW, hiddenOffset: t0 * hiddenStride,
+                             onesScale: b.effectiveScales[L], tokens: n)
             for j in 0..<n {
                 let t = t0 + j
-                let streamOff = t * streamStride
-                b.dsv4.encodeHCPlaceMix(commandBuffer: cb,
-                                        streams: streams, streamsOffset: streamOff,
-                                        sub: oOutB, subOffset: j * hiddenStride,
-                                        post: hcPostAB, postOffset: j * hcPostStride,
-                                        comb: hcCombAB, combOffset: j * hcCombStride,
-                                        outStreams: streamsAlt, outStreamsOffset: streamOff,
-                                        hcMult: hc.mult, hidden: cfg.hiddenSize)
-
-                b.dsv4.encodeHCWeights(commandBuffer: cb,
-                                       streams: streamsAlt, streamsOffset: streamOff,
-                                       fn: ffnFn.buffer, fnOffset: Int(ffnFn.offset),
-                                       base: ffnBase.buffer, baseOffset: Int(ffnBase.offset),
-                                       scale: ffnScale3.buffer, scaleOffset: Int(ffnScale3.offset),
-                                       outPre: hcPreF,
-                                       outPost: hcPostF, outPostOffset: t * hcPostStride,
-                                       outComb: hcCombF, outCombOffset: t * hcCombStride,
-                                       hcMult: hc.mult, hidden: cfg.hiddenSize,
-                                       sinkhornIters: hc.sinkhornIters,
-                                       hcEps: Float(hc.eps), rmsEps: eps)
-                b.dsv4.encodeHCCollapse(commandBuffer: cb,
-                                        streams: streamsAlt, streamsOffset: streamOff,
-                                        pre: hcPreF, x: hidden,
-                                        hcMult: hc.mult, hidden: cfg.hiddenSize)
-                b.rms.encodeBF16W(commandBuffer: cb, x: hidden,
-                                  weight: postAttn.buffer,
-                                  weightOffset: Int(postAttn.offset),
-                                  out: routedX, outOffset: t * hiddenStride,
-                                  d: D, eps: eps)
-
                 if let hashTable {
                     writeHashRoute(table: hashTable, token: tokens[t], tokenIndex: t)
-                    encodeRouterGemv(cb, weights: routerW, hiddenOffset: t * hiddenStride,
-                                     onesScale: b.effectiveScales[L])
-                    encodeRouterHashWeights(cb, tokenIndex: t)
+                    encodeRouterHashWeights(cb, tokenIndex: t, batchRow: j)
                 } else {
-                    encodeRouterGemv(cb, weights: routerW, hiddenOffset: t * hiddenStride,
-                                     onesScale: b.effectiveScales[L])
-                    encodeRouterSelect(cb, correctionBias: correctionBias!, tokenIndex: t)
+                    encodeRouterSelect(cb, correctionBias: correctionBias!, tokenIndex: t, batchRow: j)
                 }
             }
 
             encodeSharedExpert(cb, proj: sharedProj, firstToken: t0, tokens: n)
+            // Commit each batch as it is encoded so the GPU starts while the
+            // CPU encodes the next one; queue order keeps the batches serial.
+            if t0 + n < T {
+                cb.commit()
+                cb = try makeCommandBuffer()
+            }
         }
-
         cb.commit()
         try wait(cb)
         b.state.counters[L] = counters
@@ -777,7 +807,8 @@ final class DSV4ChunkedPrefill {
         }
 
         let routesPtr = routesBuffer.contents()
-            .bindMemory(to: DSV4PrefillRoute.self, capacity: routeCount)
+            .bindMemory(to: DSV4PrefillRoute.self,
+                        capacity: routeCount + cfg.numExperts * (Self.groupRoutes - 1))
         let perTile = tileScheduler.config.tileExperts
         var tiles: [(experts: [Int], routeStart: Int, routeCount: Int)] = []
         var written = 0
@@ -791,6 +822,10 @@ final class DSV4ChunkedPrefill {
                         token: UInt32(route / topK),
                         rank: UInt32(route % topK),
                         localSlot: UInt32(localSlot))
+                    written += 1
+                }
+                while written % Self.groupRoutes != 0 {
+                    routesPtr[written] = DSV4PrefillRoute(token: 0, rank: 0, localSlot: .max)
                     written += 1
                 }
             }
@@ -882,15 +917,10 @@ final class DSV4ChunkedPrefill {
         let cfg = b.cfg
         let hc = cfg.hyperConnections
         let cb = try makeCommandBuffer()
-        for t in 0..<T {
-            b.dsv4.encodeHCPlaceMix(commandBuffer: cb,
-                                    streams: streamsAlt, streamsOffset: t * streamStride,
-                                    sub: h2, subOffset: t * hiddenStride,
-                                    post: hcPostF, postOffset: t * hcPostStride,
-                                    comb: hcCombF, combOffset: t * hcCombStride,
-                                    outStreams: streams, outStreamsOffset: t * streamStride,
-                                    hcMult: hc.mult, hidden: cfg.hiddenSize)
-        }
+        b.dsv4.encodeHCPlaceMix(commandBuffer: cb,
+                                streams: streamsAlt, sub: h2,
+                                post: hcPostF, comb: hcCombF, outStreams: streams,
+                                hcMult: hc.mult, hidden: cfg.hiddenSize, tokens: T)
         cb.commit()
         try wait(cb)
     }
@@ -1001,13 +1031,15 @@ final class DSV4ChunkedPrefill {
     /// `gemv` for `tokens` consecutive rows of `x` into consecutive rows of
     /// `y`, reading the weights once.
     private func multiGemv(_ cb: MTLCommandBuffer, _ view: TensorView,
-                           x: MTLBuffer, y: MTLBuffer,
+                           x: MTLBuffer, xOffset: Int = 0,
+                           y: MTLBuffer, yOffset: Int = 0,
                            m: Int, n: Int, tokens: Int) {
         multiX.encode(commandBuffer: cb,
                       weights: view.buffer, weightsOffset: Int(view.offset),
                       scales: view.buffer, scalesOffset: Int(view.scaleOffset),
                       biases: view.buffer, biasesOffset: Int(view.biasOffset),
-                      x: x, y: y, m: m, n: n, tokens: tokens)
+                      x: x, xOffset: xOffset, y: y, yOffset: yOffset,
+                      m: m, n: n, tokens: tokens)
     }
 
     private func writeHashRoute(table: TensorView, token: Int32, tokenIndex t: Int) {
@@ -1033,7 +1065,8 @@ final class DSV4ChunkedPrefill {
     private func encodeRouterGemv(_ cb: MTLCommandBuffer,
                                   weights: TensorView,
                                   hiddenOffset: Int,
-                                  onesScale: MTLBuffer) {
+                                  onesScale: MTLBuffer,
+                                  tokens: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         var expertCount = UInt32(b.cfg.numExperts)
         var dimension = UInt32(b.cfg.hiddenSize)
@@ -1045,19 +1078,20 @@ final class DSV4ChunkedPrefill {
         enc.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
         enc.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 5)
         enc.dispatchThreadgroups(
-            MTLSize(width: (b.cfg.numExperts + 3) / 4, height: 1, depth: 1),
+            MTLSize(width: (b.cfg.numExperts + 3) / 4, height: tokens, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         enc.endEncoding()
     }
 
     private func encodeRouterSelect(_ cb: MTLCommandBuffer,
                                     correctionBias: TensorView,
-                                    tokenIndex t: Int) {
+                                    tokenIndex t: Int, batchRow j: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         var expertCount = UInt32(b.cfg.numExperts)
         var scale = Float(b.cfg.routedScalingFactor)
         enc.setComputePipelineState(routerSelectPSO)
-        enc.setBuffer(routerLogits, offset: 0, index: 0)
+        enc.setBuffer(routerLogits, offset: j * b.cfg.numExperts * MemoryLayout<Float>.stride,
+                      index: 0)
         enc.setBuffer(correctionBias.buffer, offset: Int(correctionBias.offset), index: 1)
         enc.setBuffer(routeIndices,
                       offset: t * b.cfg.topKExperts * MemoryLayout<UInt32>.stride, index: 2)
@@ -1069,11 +1103,12 @@ final class DSV4ChunkedPrefill {
         enc.endEncoding()
     }
 
-    private func encodeRouterHashWeights(_ cb: MTLCommandBuffer, tokenIndex t: Int) {
+    private func encodeRouterHashWeights(_ cb: MTLCommandBuffer, tokenIndex t: Int, batchRow j: Int) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         var scale = Float(b.cfg.routedScalingFactor)
         enc.setComputePipelineState(routerHashPSO)
-        enc.setBuffer(routerLogits, offset: 0, index: 0)
+        enc.setBuffer(routerLogits, offset: j * b.cfg.numExperts * MemoryLayout<Float>.stride,
+                      index: 0)
         enc.setBuffer(routeIndices,
                       offset: t * b.cfg.topKExperts * MemoryLayout<UInt32>.stride, index: 1)
         enc.setBuffer(routeWeights, offset: t * b.cfg.topKExperts * Self.fp16, index: 2)
@@ -1137,7 +1172,7 @@ final class DSV4ChunkedPrefill {
         enc.setBuffer(routesBuffer, offset: 0, index: 8)
         enc.setBytes(&start, length: MemoryLayout<UInt32>.stride, index: 9)
         enc.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 10)
-        let rows = routeCount * rowsPerRoute
+        let rows = routeCount / Self.groupRoutes * rowsPerRoute
         enc.dispatchThreadgroups(
             MTLSize(width: (rows + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -1154,5 +1189,23 @@ final class DSV4ChunkedPrefill {
     private func wait(_ cb: MTLCommandBuffer) throws {
         cb.waitUntilCompleted()
         if let error = cb.error { throw error }
+    }
+}
+
+/// One-way stop signal shared with a background page-cache warm.
+private final class StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
