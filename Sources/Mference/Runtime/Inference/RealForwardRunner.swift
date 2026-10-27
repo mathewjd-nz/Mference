@@ -2842,6 +2842,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                               into logits: MTLBuffer,
                               emitHead: Bool,
                               outputMode: PrefillOutputMode) async throws {
+        ctx.keepWarm.touch()
         let kvPosition = kv?.position ?? 0
         guard kvPosition == position else {
             throw PrefillError.prefillCursorMismatch(

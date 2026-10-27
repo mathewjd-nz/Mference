@@ -46,6 +46,8 @@ public final class MetalContext: @unchecked Sendable {
     public let device:  MTLDevice
     public let queue:   MTLCommandQueue
     public let library: MTLLibrary
+    /// Holds GPU clocks up between decode's short command buffers.
+    public private(set) var keepWarm: GPUKeepWarm!
 
     private struct PipelineCacheKey: Hashable {
         var name: String
@@ -64,6 +66,7 @@ public final class MetalContext: @unchecked Sendable {
         self.device  = dev
         self.queue   = q
         self.library = try Self.compileShaderLibrary(device: dev)
+        self.keepWarm = try GPUKeepWarm.shared(device: dev) { try pipeline("gpu_keep_warm") }
     }
 
     /// Production shader modules compiled into the shared runtime library.
